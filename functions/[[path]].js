@@ -1,5 +1,13 @@
 export async function onRequest(context) {
-    return await handleRequest(context.request, context.env, context)
+    try {
+        return await handleRequest(context.request, context.env, context);
+    } catch (error) {
+        // 如果崩溃了，就把错误原因直接显示在网页上
+        return new Response(`💥 崩溃啦！错误信息 (Crash Log):\n\n${error.message}\n\n堆栈:\n${error.stack}\n\n环境变量状态: ${JSON.stringify(Object.keys(context.env || {}))}`, { 
+            status: 500,
+            headers: { 'content-type': 'text/plain;charset=UTF-8' }
+        });
+    }
 }
 
 async function handleRequest(request, env, ctx) {
