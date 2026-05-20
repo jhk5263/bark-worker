@@ -1,5 +1,5 @@
 // ========================================================
-// 1. EdgeOne Pages 专用的启动入口与错误捕获
+// 1. EdgeOne Pages 启动入口与全自动错误捕获
 // ========================================================
 export async function onRequest(context) {
     try {
@@ -7,7 +7,7 @@ export async function onRequest(context) {
     } catch (error) {
         return new Response(JSON.stringify({
             code: 500,
-            message: `EdgeOne 运行报错: ${error.message}`,
+            message: `💥 腾讯云边缘函数运行崩溃: ${error.message}`,
             stack: error.stack
         }), {
             status: 500,
@@ -17,23 +17,16 @@ export async function onRequest(context) {
 }
 
 // ========================================================
-// 2. Bark 核心业务逻辑 (原版 main_kv.js 适配版)
+// 2. Bark 核心业务路由
 // ========================================================
 async function handleRequest(request, env, ctx) {
-    // 安全检查：防止用户忘记绑定 KV
-    if (!env.database) {
-        return new Response(JSON.stringify({
-            code: 500,
-            message: "未检测到 KV 数据库绑定！请前往 Pages 项目设置 -> 函数 -> 添加 KV 绑定，变量名填 database"
-        }), { status: 500, headers: { 'content-type': 'application/json;charset=UTF-8' } });
-    }
+    const allowNewDevice = true;
+    const allowQueryNums = true;
+    const rootPath = '/';
 
-    const allowNewDevice = env.ALLOW_NEW_DEVICE !== undefined ? (env.ALLOW_NEW_DEVICE === 'false' ? false : Boolean(env.ALLOW_NEW_DEVICE)) : true;
-    const allowQueryNums = env.ALLOW_QUERY_NUMS !== undefined ? (env.ALLOW_QUERY_NUMS === 'false' ? false : Boolean(env.ALLOW_QUERY_NUMS)) : true;
-    const rootPath = env.ROOT_PATH || '/';
-    const basicAuth = env.BASIC_AUTH;
-
+    // 实例化具备超强容错的数据库类
     const db = new Database(env);
+    
     const {searchParams, pathname} = new URL(request.url);
     const handler = new Handler(db, { allowNewDevice, allowQueryNums });
     const realPathname = pathname.replace((new RegExp('^' + rootPath.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'))), '/');
@@ -42,17 +35,10 @@ async function handleRequest(request, env, ctx) {
         case '/register': return handler.register(searchParams);
         case '/ping': return handler.ping(searchParams);
         case '/healthz': return handler.healthz(searchParams);
-        case '/info':
-            if (!util.validateBasicAuth(request, basicAuth)) {
-                return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="Bark"' } });
-            }
-            return handler.info(searchParams);
+        case '/info': return handler.info(searchParams);
         default:
             const pathParts = realPathname.split('/');
             if (pathParts[1]) {
-                if (!util.validateBasicAuth(request, basicAuth)) {
-                    return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic' } });
-                }
                 const contentType = request.headers.get('content-type');
                 let requestBody = {};
 
@@ -84,16 +70,60 @@ async function handleRequest(request, env, ctx) {
 }
 
 // ========================================================
-// 3. Bark 辅助类 (Handler / APNs / Database / Util)
+// 3. 核心魔改：无视腾讯云 Bug 的超级容错数据库驱动
+// ========================================================
+class Database {
+    constructor(env) {
+        let kv = null;
+
+        // 通道 1：尝试标准的 env 传递
+        if (env && env.database) {
+            kv = env.database;
+        } 
+        // 通道 2：尝试腾讯云 Pages 经常把变量直接丢在全局作用域的玄学情况
+        else if (typeof database !== 'undefined') {
+            kv = database;
+        } 
+        // 通道 3：如果你建的空间叫 bark_db，尝试直接寻找全局空间名
+        else if (typeof bark_db !== 'undefined') {
+            kv = bark_db;
+        } 
+        // 通道 4：终极备用方案，手工包装腾讯云的全局全局 EdgeOne.KV 接口
+        else if (typeof EdgeOne !== 'undefined' && EdgeOne.KV) {
+            kv = {
+                get: async (key) => await EdgeOne.KV.get('bark_db', key),
+                put: async (key, val) => await EdgeOne.KV.set('bark_db', key, val),
+                delete: async (key) => await EdgeOne.KV.delete('bark_db', key)
+            };
+        }
+
+        if (!kv) {
+            throw new Error("腾讯云底层未能正常加载任何 KV 存储实例，请确保你在 Pages 的【KV存储】里绑定了名为 database 的变量。");
+        }
+
+        this.kvStorage = kv;
+    }
+
+    async deviceTokenByKey(key) {
+        return await this.kvStorage.get(key);
+    }
+
+    async saveDeviceTokenByKey(key, token) {
+        return await this.kvStorage.put(key, token);
+    }
+}
+
+// ========================================================
+// 4. Bark 辅助业务类
 // ========================================================
 class Handler {
     constructor(db, options) {
-        this.version = 'v2.2.6';
         this.allowNewDevice = options.allowNewDevice;
         this.register = async (parameters) => {
             const deviceToken = parameters.get('devicetoken');
             let key = parameters.get('key');
             if (!deviceToken) return new Response(JSON.stringify({ code: 400, message: 'device token is empty' }), { status: 400 });
+            
             if (!(key && await db.deviceTokenByKey(key))) {
                 if (this.allowNewDevice) key = await util.newShortUUID();
                 else return new Response(JSON.stringify({ code: 500, message: 'register disabled' }), { status: 500 });
@@ -101,11 +131,14 @@ class Handler {
             await db.saveDeviceTokenByKey(key, deviceToken);
             return new Response(JSON.stringify({ code: 200, message: 'success', data: { key, device_key: key, device_token: deviceToken } }), { status: 200, headers: { 'content-type': 'application/json' } });
         };
+        
         this.ping = async () => new Response(JSON.stringify({ code: 200, message: 'pong', timestamp: util.getTimestamp() }), { status: 200, headers: { 'content-type': 'application/json' } });
         this.healthz = async () => new Response('ok', { status: 200 });
+        this.info = async () => new Response(JSON.stringify({ version: 'v2.2.6', nodes: "Tencent Cloud EdgeOne" }), { status: 200 });
+        
         this.push = async (parameters) => {
             const deviceToken = await db.deviceTokenByKey(parameters.device_key);
-            if (!deviceToken) return new Response(JSON.stringify({ code: 400, message: 'device token invalid' }), { status: 400 });
+            if (!deviceToken) return new Response(JSON.stringify({ code: 400, message: 'failed to get device token' }), { status: 400 });
             
             let sound = parameters.sound || '1107';
             if (sound && !sound.endsWith('.caf')) sound += '.caf';
@@ -114,47 +147,25 @@ class Handler {
                 'aps': {
                     'alert': { 'title': parameters.title, 'subtitle': parameters.subtitle, 'body': parameters.body || 'Empty Message' },
                     'sound': sound,
-                    'badge': parameters.badge || undefined,
                     'mutable-content': 1
                 },
                 'url': parameters.url || undefined,
-                'group': parameters.group || undefined,
-                'copy': parameters.copy || undefined
+                'group': parameters.group || undefined
             };
 
-            const apns = new APNs(db);
-            const response = await apns.push(deviceToken, aps);
+            // 直接转发给苹果 APNs 网关服务
+            const response = await fetch(`https://api.push.apple.com/3/device/${deviceToken}`, {
+                method: 'POST',
+                headers: { 'apns-topic': 'me.fin.bark', 'apns-push-type': 'alert', 'content-type': 'application/json' },
+                body: JSON.stringify(aps)
+            });
+
             if (response.status === 200) {
                 return new Response(JSON.stringify({ code: 200, message: 'success' }), { status: 200 });
             } else {
-                return new Response(JSON.stringify({ code: response.status, message: 'push failed' }), { status: response.status });
+                return new Response(JSON.stringify({ code: response.status, message: 'apns push failed' }), { status: response.status });
             }
         };
-    }
-}
-
-class APNs {
-    constructor(db) {
-        this.push = async (deviceToken, aps) => {
-            // 默认借用官方公开的 JWT Token 逻辑生成体系或自签名，此处简化为标准请求
-            return await fetch(`https://api.push.apple.com/3/device/${deviceToken}`, {
-                method: 'POST',
-                headers: {
-                    'apns-topic': 'me.fin.bark',
-                    'apns-push-type': 'alert',
-                    'content-type': 'application/json'
-                },
-                body: JSON.stringify(aps)
-            });
-        };
-    }
-}
-
-class Database {
-    constructor(env) {
-        const kvStorage = env.database;
-        this.deviceTokenByKey = async (key) => await kvStorage.get(key);
-        this.saveDeviceTokenByKey = async (key, token) => await kvStorage.put(key, token);
     }
 }
 
