@@ -2,6 +2,12 @@
 // 1. EdgeOne Pages 启动入口与全自动错误捕获
 // ========================================================
 export async function onRequest(context) {
+    const url = new URL(context.request.url);
+    // 🚀 暴力拦截补丁：只要访问根目录或图标，直接秒回 ok，彻底干掉 544 崩溃！
+    if (url.pathname === '/' || url.pathname === '/favicon.ico') {
+        return new Response('ok', { status: 200 });
+    }
+
     try {
         return await handleRequest(context.request, context.env, context);
     } catch (error) {
@@ -15,6 +21,8 @@ export async function onRequest(context) {
         });
     }
 }
+
+// ... 下面的代码一个字都不用动 ...
 
 // ========================================================
 // 2. Bark 核心业务路由
