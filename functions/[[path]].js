@@ -40,6 +40,23 @@ function isDuplicate(sig) {
     return false;
 }
 
+function stageError(stage, error) {
+    const message = String(error && error.message || error);
+    if (message.startsWith('apns.')) return error;
+    return new Error(`${stage}: ${message}`);
+}
+
+function buildNtfyRequest(server, topic, title, message) {
+    return {
+        url: `${server.replace(/\/+$/, '')}/`,
+        options: {
+            method: 'POST',
+            body: JSON.stringify({ topic, title, message }),
+            headers: { 'Content-Type': 'application/json; charset=utf-8' }
+        }
+    };
+}
+
 // ========== KV 解析（按腾讯云 EdgeOne 官方文档）==========
 // 官方文档：https://cloud.tencent.com/document/product/1552/127420
 // 官方示例中，绑定名（如 my_kv / database）直接作为函数作用域内的
@@ -130,7 +147,12 @@ class APNs {
     }
 
     async getAuthToken() {
-        const cached = await this.db.getAuth();
+        let cached;
+        try {
+            cached = await this.db.getAuth();
+        } catch (e) {
+            throw stageError('apns.auth_cache_read', e);
+        }
         if (cached) {
             try {
                 const parsed = JSON.parse(cached);
@@ -138,7 +160,11 @@ class APNs {
             } catch (e) { /* 失效重新生成 */ }
         }
         const token = await this.generateAuthToken();
-        await this.db.saveAuth(JSON.stringify({ token, expiresAt: Date.now() + 55 * 60 * 1000 }));
+        try {
+            await this.db.saveAuth(JSON.stringify({ token, expiresAt: Date.now() + 55 * 60 * 1000 }));
+        } catch (e) {
+            throw stageError('apns.auth_cache_write', e);
+        }
         return token;
     }
 
@@ -147,10 +173,20 @@ class APNs {
             .replace('-----BEGIN PRIVATE KEY-----', '')
             .replace('-----END PRIVATE KEY-----', '')
             .replace(/\s/g, '');
-        const rawKey = Uint8Array.from(atob(pem), c => c.charCodeAt(0));
-        const privateKey = await crypto.subtle.importKey(
-            'pkcs8', rawKey, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']
-        );
+        let rawKey;
+        let privateKey;
+        try {
+            rawKey = Uint8Array.from(atob(pem), c => c.charCodeAt(0));
+        } catch (e) {
+            throw stageError('apns.pem_decode', e);
+        }
+        try {
+            privateKey = await crypto.subtle.importKey(
+                'pkcs8', rawKey, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']
+            );
+        } catch (e) {
+            throw stageError('apns.jwt_import_key', e);
+        }
         const now = Math.floor(Date.now() / 1000);
         const encode = (obj) => {
             return btoa(String.fromCharCode(...new Uint8Array(new TextEncoder().encode(JSON.stringify(obj)))))
@@ -159,11 +195,16 @@ class APNs {
         const headerEncoded = encode({ alg: 'ES256', typ: 'JWT', kid: APNS_KEY_ID });
         const payloadEncoded = encode({ iss: APNS_TEAM_ID, iat: now });
         const signingInput = `${headerEncoded}.${payloadEncoded}`;
-        const signature = await crypto.subtle.sign(
-            { name: 'ECDSA', hash: { name: 'SHA-256' } },
-            privateKey,
-            new TextEncoder().encode(signingInput)
-        );
+        let signature;
+        try {
+            signature = await crypto.subtle.sign(
+                { name: 'ECDSA', hash: { name: 'SHA-256' } },
+                privateKey,
+                new TextEncoder().encode(signingInput)
+            );
+        } catch (e) {
+            throw stageError('apns.jwt_sign', e);
+        }
         let sig = btoa(String.fromCharCode(...new Uint8Array(signature)))
             .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
         return `${signingInput}.${sig}`;
@@ -181,11 +222,15 @@ class APNs {
         if (headers['priority'])     apnsHeaders['apns-priority'] = headers['priority'];
         if (headers['expiration'])   apnsHeaders['apns-expiration'] = headers['expiration'];
 
-        return fetch(`https://${APNS_HOST_NAME}/3/device/${deviceToken}`, {
-            method: 'POST',
-            headers: apnsHeaders,
-            body: JSON.stringify(aps)
-        });
+        try {
+            return await fetch(`https://${APNS_HOST_NAME}/3/device/${deviceToken}`, {
+                method: 'POST',
+                headers: apnsHeaders,
+                body: JSON.stringify(aps)
+            });
+        } catch (e) {
+            throw stageError('apns.fetch', e);
+        }
     }
 }
 
@@ -394,11 +439,8 @@ export async function onRequest({ request, env }) {
     // 安卓推送（ntfy）：每次 iOS 推送后同步发出
     if (NTFY_SERVER && NTFY_TOPIC) {
         try {
-            const nr = await fetch(`${NTFY_SERVER}/${NTFY_TOPIC}`, {
-                method: 'POST',
-                body: JSON.stringify({ topic: NTFY_TOPIC, title, message: body }),
-                headers: { 'Content-Type': 'application/json' }
-            });
+            const ntfyRequest = buildNtfyRequest(NTFY_SERVER, NTFY_TOPIC, title, body);
+            const nr = await fetch(ntfyRequest.url, ntfyRequest.options);
             results.push({ ntfy: nr.status });
         } catch (e) {
             results.push({ ntfy_error: String(e && e.message || e) });
