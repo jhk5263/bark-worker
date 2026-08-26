@@ -198,7 +198,7 @@ class APNs {
         let signature;
         try {
             signature = await crypto.subtle.sign(
-                { name: 'ECDSA', hash: { name: 'SHA-256' } },
+                { name: 'ECDSA', hash: 'SHA-256' },
                 privateKey,
                 new TextEncoder().encode(signingInput)
             );
