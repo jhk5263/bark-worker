@@ -40,12 +40,32 @@ function isDuplicate(sig) {
     return false;
 }
 
-// ========== KV 数据库（EdgeOne 官方调用：env.database.get/put/delete）==========
+// ========== KV 解析（按腾讯云 EdgeOne 官方文档）==========
+// 官方文档：https://cloud.tencent.com/document/product/1552/127420
+// 官方示例中，绑定名（如 my_kv / database）直接作为函数作用域内的
+// 全局标识符访问：my_kv.get(...) / my_kv.put(...)，不是 env.my_kv。
+// 为兼容两种注入方式，这里统一解析：
+function resolveDatabase(env) {
+    // 方式一：绑定名作为全局标识符（EdgeOne 官方方式）
+    if (typeof database !== 'undefined') {
+        return database;
+    }
+    // 方式二：通过 env.database 注入
+    if (env && env.database) {
+        return env.database;
+    }
+    return null;
+}
+
+// ========== KV 数据库 ==========
 class Database {
     constructor(env) {
-        this.kv = (env && env.database) || null;
+        this.kv = resolveDatabase(env);
+
         if (!this.kv) {
-            throw new Error('EdgeOne KV database 未绑定：请在 Pages 项目把 KV 绑定变量名设为 database 并重新部署');
+            throw new Error(
+                'EdgeOne KV database 未注入，请确认绑定变量名为 database 并重新部署'
+            );
         }
     }
 
@@ -196,22 +216,25 @@ export async function onRequest({ request, env }) {
         }), { headers: { 'content-type': 'application/json' } });
     }
 
-    // 调试：真实 put/get/delete 自检（不依赖 Object.keys(env)）
+    // 调试：真实 put/get/delete 自检（兼容两种 KV 注入方式）
     if (path === '/debug') {
+        const kv = resolveDatabase(env);
         const result = {
             hasEnv: !!env,
-            hasDatabase: !!(env && env.database),
+            hasEnvDatabase: !!(env && env.database),
+            hasGlobalDatabase: typeof database !== 'undefined',
+            hasDatabase: !!kv,
             write: false,
             read: null,
             error: dbError ? String(dbError) : null
         };
-        if (env && env.database) {
+        if (kv) {
             try {
                 const testKey = `selftest:${Date.now()}`;
-                await env.database.put(testKey, 'hello');
+                await kv.put(testKey, 'hello');
                 result.write = true;
-                result.read = await env.database.get(testKey);
-                await env.database.delete(testKey);
+                result.read = await kv.get(testKey);
+                await kv.delete(testKey);
             } catch (e) {
                 result.error = String(e && e.message || e);
             }
