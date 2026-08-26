@@ -244,6 +244,30 @@ export async function onRequest(context) {
         }), { headers: { 'content-type': 'application/json' } });
     }
 
+    // 调试：查看运行时环境 + KV 自检（排查绑定问题用，排查完可删）
+    if (path === '/debug') {
+        const envKeys = context.env ? Object.keys(context.env) : [];
+        const hasDB = !!(context.env && context.env.database);
+        let selfTest = null;
+        if (hasDB) {
+            try {
+                const testKey = 'selftest:' + Date.now();
+                await context.env.database.put(testKey, 'hello');
+                const readBack = await context.env.database.get(testKey);
+                await context.env.database.delete(testKey);
+                selfTest = { wrote: true, readBack: readBack === null ? '(null)' : readBack };
+            } catch (e) {
+                selfTest = { wrote: false, error: String(e && e.message || e) };
+            }
+        }
+        return new Response(JSON.stringify({
+            envKeys,
+            hasDB,
+            selfTest,
+            dbMode: hasDB ? 'kv' : 'memory'
+        }, null, 2), { headers: { 'content-type': 'application/json' } });
+    }
+
     // 设备注册
     if (path === '/register') {
         const deviceToken = url.searchParams.get('devicetoken') || url.searchParams.get('device_token');
